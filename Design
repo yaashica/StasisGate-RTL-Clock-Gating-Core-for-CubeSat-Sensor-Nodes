@@ -1,0 +1,285 @@
+
+ 
+`timescale 1ns/1ps
+
+//  1. ORBIT TIMER
+
+module orbit_timer #(
+    parameter ECLIPSE_CYCLES = 20,   // shortened for simulation
+    parameter SUNLIT_CYCLES  = 30
+)(
+    input  wire clk,
+    input  wire rst_n,
+    output reg  sunlit,
+    output reg  eclipse
+);
+    localparam PERIOD = ECLIPSE_CYCLES + SUNLIT_CYCLES;
+    reg [15:0] cnt;
+ 
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            cnt     <= 16'd0;
+            sunlit  <= 1'b0;
+            eclipse <= 1'b1;
+        end else begin
+            if (cnt == PERIOD - 1)
+                cnt <= 16'd0;
+            else
+                cnt <= cnt + 1'b1;
+ 
+            // Sunlit window: first SUNLIT_CYCLES ticks
+            if (cnt < SUNLIT_CYCLES) begin
+                sunlit  <= 1'b1;
+                eclipse <= 1'b0;
+            end else begin
+                sunlit  <= 1'b0;
+                eclipse <= 1'b1;
+            end
+        end
+    end
+endmodule
+ 
+ 
+//  2. TASK QUEUE  (2-bit pending register)
+
+module task_queue (
+    input  wire       clk,
+    input  wire       rst_n,
+    input  wire [1:0] push_task,   // set bits to enqueue
+    input  wire       pop_task,    // clear queue when FSM handles
+    output reg  [1:0] pending      // current pending bits
+);
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            pending <= 2'b00;
+        else if (pop_task)
+            pending <= 2'b00;
+        else
+            pending <= pending | push_task;
+    end
+endmodule
+ 
+ 
+
+//  3. POWER FSM
+
+module power_fsm (
+    input  wire clk,
+    input  wire rst_n,
+    input  wire sunlit,
+    input  wire eclipse,
+    input  wire [1:0] pending,
+    output reg  [2:0] state,
+    output reg        fsm_pop,     
+    output reg        radio_en,
+    output reg        imu_en,
+    output reg        temp_en
+);
+    // One-hot state encoding
+    localparam ACTIVE     = 3'b001;
+    localparam IDLE       = 3'b010;
+    localparam DEEP_SLEEP = 3'b100;
+ 
+    reg [2:0] next_state;
+    wire tasks_present = |pending;
+ 
+    //Next-state logic 
+    always @(*) begin
+        next_state = state;
+        case (state)
+            ACTIVE: begin
+                if (!tasks_present && sunlit)  next_state = IDLE;
+                if (!tasks_present && eclipse) next_state = DEEP_SLEEP;
+            end
+            IDLE: begin
+                if (tasks_present || eclipse)  next_state = ACTIVE;
+                if (eclipse && !tasks_present) next_state = DEEP_SLEEP;
+            end
+            DEEP_SLEEP: begin
+                if (sunlit && tasks_present)   next_state = ACTIVE;
+                if (sunlit && !tasks_present)  next_state = IDLE;
+            end
+            default: next_state = IDLE;
+        endcase
+    end
+ 
+    // ── State register 
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            state <= IDLE;
+        else
+            state <= next_state;
+    end
+ 
+    // ── Output logic (Moore) 
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            radio_en <= 1'b0;
+            imu_en   <= 1'b0;
+            temp_en  <= 1'b0;
+            fsm_pop  <= 1'b0;
+        end else begin
+            fsm_pop <= 1'b0; // default: no pop
+ 
+            case (next_state)
+                ACTIVE: begin
+                    radio_en <= pending[1];  // radio only if task queued
+                    imu_en   <= 1'b1;
+                    temp_en  <= 1'b1;
+                    if (tasks_present)
+                        fsm_pop <= 1'b1;    // consume tasks
+                end
+                IDLE: begin
+                    radio_en <= 1'b0;
+                    imu_en   <= 1'b0;
+                    temp_en  <= 1'b1;       // temp stays on in idle
+                end
+                DEEP_SLEEP: begin
+                    radio_en <= 1'b0;
+                    imu_en   <= 1'b0;
+                    temp_en  <= 1'b0;
+                end
+                default: begin
+                    radio_en <= 1'b0;
+                    imu_en   <= 1'b0;
+                    temp_en  <= 1'b0;
+                end
+            endcase
+        end
+    end
+endmodule
+ 
+ 
+
+//  4. CLOCK GATE UNIT
+
+module clk_gate_unit (
+    input  wire clk,
+    input  wire radio_en,
+    input  wire imu_en,
+    input  wire temp_en,
+    output wire en_clk_radio,
+    output wire en_clk_imu,
+    output wire en_clk_temp
+);
+    // Latch-based ICG (negedge latch — standard cell model)
+    reg lat_radio, lat_imu, lat_temp;
+ 
+    always @(*) if (!clk) lat_radio <= radio_en;
+    always @(*) if (!clk) lat_imu   <= imu_en;
+    always @(*) if (!clk) lat_temp  <= temp_en;
+ 
+    assign en_clk_radio = clk & lat_radio;
+    assign en_clk_imu   = clk & lat_imu;
+    assign en_clk_temp  = clk & lat_temp;
+endmodule
+ 
+ 
+
+//  5. POWER ESTIMATOR
+
+module power_estimator #(
+    parameter CSW_SCALE = 8'd10,   // Csw × 1000 (pF, scaled)
+    parameter VDD_SQ    = 8'd33    // Vdd² × 10 (3.3V → 10.89 ≈ 11, scaled)
+)(
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire [15:0] toggle_radio,
+    input  wire [15:0] toggle_imu,
+    input  wire [15:0] toggle_temp,
+    output reg  [31:0] power_mW    // scaled milliwatt estimate
+);
+    wire [15:0] total_toggles = toggle_radio + toggle_imu + toggle_temp;
+ 
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            power_mW <= 32'd0;
+        else
+            // P = toggles × Csw_scale × Vdd_sq (fixed-point, adjust divisor in TB)
+            power_mW <= total_toggles * CSW_SCALE * VDD_SQ;
+    end
+endmodule
+ 
+ 
+
+//  6. TOP-LEVEL: powergate_ip
+
+module powergate_ip #(
+    parameter ECLIPSE_CYCLES = 20,
+    parameter SUNLIT_CYCLES  = 30
+)(
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire [1:0]  push_task,
+    // Power estimator toggle inputs (driven by testbench)
+    input  wire [15:0] toggle_radio,
+    input  wire [15:0] toggle_imu,
+    input  wire [15:0] toggle_temp,
+    // Gated clocks
+    output wire        en_clk_radio,
+    output wire        en_clk_imu,
+    output wire        en_clk_temp,
+    // State & power
+    output wire [2:0]  fsm_state,
+    output wire [31:0] power_mW,
+    // Debug
+    output wire        sunlit,
+    output wire        eclipse
+);
+ 
+    wire [1:0] pending;
+    wire       fsm_pop;
+    wire       radio_en, imu_en, temp_en;
+ 
+    orbit_timer #(
+        .ECLIPSE_CYCLES(ECLIPSE_CYCLES),
+        .SUNLIT_CYCLES (SUNLIT_CYCLES)
+    ) u_orbit (
+        .clk    (clk),
+        .rst_n  (rst_n),
+        .sunlit (sunlit),
+        .eclipse(eclipse)
+    );
+ 
+    task_queue u_tq (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .push_task(push_task),
+        .pop_task (fsm_pop),
+        .pending  (pending)
+    );
+ 
+    power_fsm u_fsm (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .sunlit  (sunlit),
+        .eclipse (eclipse),
+        .pending (pending),
+        .state   (fsm_state),
+        .fsm_pop (fsm_pop),
+        .radio_en(radio_en),
+        .imu_en  (imu_en),
+        .temp_en (temp_en)
+    );
+ 
+    clk_gate_unit u_cgu (
+        .clk         (clk),
+        .radio_en    (radio_en),
+        .imu_en      (imu_en),
+        .temp_en     (temp_en),
+        .en_clk_radio(en_clk_radio),
+        .en_clk_imu  (en_clk_imu),
+        .en_clk_temp (en_clk_temp)
+    );
+ 
+    power_estimator u_pest (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .toggle_radio(toggle_radio),
+        .toggle_imu  (toggle_imu),
+        .toggle_temp (toggle_temp),
+        .power_mW    (power_mW)
+    );
+ 
+endmodule
+ 
