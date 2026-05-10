@@ -1,0 +1,18 @@
+Click here to access directly--> https://www.edaplayground.com/x/Yric
+
+## How to Run the Simulation (EDA Playground):
+
+No local tools needed – runs in your browser.
+
+1. Go to [EDA Playground](https://www.edaplayground.com)
+2. Copy the entire [`Design.v`] file into the **Design** pane.
+3. Set:
+   - **Tool:** `Icarus Verilog 12.0`
+4. Tick **“Open EPWave”** to view the waveform.
+5. Click **Run**.
+
+The console will print the FSM transitions, toggle counts, and a **power savings report** (e.g., `Power savings ratio (×1000): 830` → 83%).
+
+Open the waveform (`powergate_ip.vcd`) and observe:
+- `fsm_state` changes between 001 (ACTIVE), 010 (IDLE), 100 (DEEP_SLEEP)
+- `en_clk_radio`, `en_clk_imu`, `en_clk_temp` – gated clocks stop completely when the FSM disables the domain.
