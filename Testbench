@@ -1,0 +1,225 @@
+//TESTBENCH — tb_powergate_ip
+
+
+module tb_powergate_ip;
+ 
+    //Clock & Reset 
+    reg         clk;
+    reg         rst_n;
+ 
+    //DUT I/O 
+
+    reg  [1:0]  push_task;
+    wire        en_clk_radio, en_clk_imu, en_clk_temp;
+    wire [2:0]  fsm_state;
+    wire [31:0] power_mW;
+    wire        sunlit, eclipse;
+ 
+    //Toggle counters (TB tracks gated clock edges) 
+
+    reg  [15:0] toggle_radio;
+    reg  [15:0] toggle_imu;
+    reg  [15:0] toggle_temp;
+ 
+    //Power budget accumulators 
+
+    integer power_ungated_acc;  // hypothetical: all clocks always on
+    integer power_gated_acc;    // actual gated power from DUT
+    integer cycle_count;
+ 
+    //State names (for display) 
+
+    reg [95:0] state_str;
+ 
+    task print_state;
+        input [2:0] s;
+        begin
+            case (s)
+                3'b001: $write("ACTIVE    ");
+                3'b010: $write("IDLE      ");
+                3'b100: $write("DEEP_SLEEP");
+                default:$write("UNKNOWN   ");
+            endcase
+        end
+    endtask
+ 
+    //DUT instantiation
+
+    powergate_ip #(
+        .ECLIPSE_CYCLES(20),
+        .SUNLIT_CYCLES (30)
+    ) dut (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .push_task   (push_task),
+        .toggle_radio(toggle_radio),
+        .toggle_imu  (toggle_imu),
+        .toggle_temp (toggle_temp),
+        .en_clk_radio(en_clk_radio),
+        .en_clk_imu  (en_clk_imu),
+        .en_clk_temp (en_clk_temp),
+        .fsm_state   (fsm_state),
+        .power_mW    (power_mW),
+        .sunlit      (sunlit),
+        .eclipse     (eclipse)
+    );
+ 
+    //Clock generation: 10 ns period (100 MHz) 
+    initial clk = 0;
+    always #5 clk = ~clk;
+ 
+    //Toggle counter — counts rising edges of gated clks
+
+    always @(posedge en_clk_radio) toggle_radio <= toggle_radio + 1;
+    always @(posedge en_clk_imu)   toggle_imu   <= toggle_imu   + 1;
+    always @(posedge en_clk_temp)  toggle_temp  <= toggle_temp  + 1;
+ 
+    //Per-cycle power budget accumulation 
+
+    always @(posedge clk) begin
+        cycle_count <= cycle_count + 1;
+        // Gated: actual power from estimator (scaled /1000 for display)
+        power_gated_acc   <= power_gated_acc   + power_mW;
+        // Ungated: assume all 3 domains always toggling (worst case)
+        // 3 domains × CSW_SCALE(10) × VDD_SQ(33) × 1 toggle/cycle
+        power_ungated_acc <= power_ungated_acc + (3 * 10 * 33);
+    end
+ 
+    //VCD dump for GTKWave 
+
+    initial begin
+        $dumpfile("powergate_ip.vcd");
+        $dumpvars(0, tb_powergate_ip);
+    end
+ 
+    //Main stimulus 
+
+    initial begin
+        // Init
+        rst_n         = 0;
+        push_task     = 2'b00;
+        toggle_radio  = 16'd0;
+        toggle_imu    = 16'd0;
+        toggle_temp   = 16'd0;
+        power_gated_acc   = 0;
+        power_ungated_acc = 0;
+        cycle_count       = 0;
+ 
+        $display("=======================================================");
+        $display("  PowerGate-IP CubeSat RTL Simulation");
+        $display("  Clock: 100 MHz | Eclipse: 20 cyc | Sunlit: 30 cyc");
+        $display("=======================================================");
+        $display(" Time(ns) | Cycle | State      | Sun | Ecl | Radio | IMU | Temp | Power(scaled)");
+        $display("----------|-------|------------|-----|-----|-------|-----|------|---------------");
+ 
+        //RESET
+
+        repeat(5) @(posedge clk);
+        rst_n = 1;
+ 
+        // ── PHASE 1: SUNLIT, NO TASKS → expect IDLE ────────
+        $display("\n[PHASE 1] Sunlit, no tasks — FSM should settle to IDLE");
+        push_task = 2'b00;
+        repeat(35) begin
+            @(posedge clk);
+            $write(" %6t    |  %3d  | ", $time, cycle_count);
+            print_state(fsm_state);
+            $display(" |  %b  |  %b  |   %b   |  %b  |   %b  | %0d",
+                sunlit, eclipse,
+                en_clk_radio, en_clk_imu, en_clk_temp,
+                power_mW);
+        end
+ 
+        //PHASE 2: SUNLIT + TASKS → expect ACTIVE
+
+        $display("\n[PHASE 2] Sunlit, Radio + IMU tasks — FSM should go ACTIVE");
+        push_task = 2'b11;   // both tasks pending
+        repeat(15) begin
+            @(posedge clk);
+            $write(" %6t    |  %3d  | ", $time, cycle_count);
+            print_state(fsm_state);
+            $display(" |  %b  |  %b  |   %b   |  %b  |   %b  | %0d",
+                sunlit, eclipse,
+                en_clk_radio, en_clk_imu, en_clk_temp,
+                power_mW);
+        end
+        push_task = 2'b00;   // tasks submitted; queue drains
+ 
+        // ── PHASE 3: ECLIPSE, NO TASKS → DEEP_SLEEP ────────
+        $display("\n[PHASE 3] Waiting for eclipse window — expect DEEP_SLEEP");
+        // Let orbit timer roll into eclipse region
+        repeat(40) begin
+            @(posedge clk);
+            $write(" %6t    |  %3d  | ", $time, cycle_count);
+            print_state(fsm_state);
+            $display(" |  %b  |  %b  |   %b   |  %b  |   %b  | %0d",
+                sunlit, eclipse,
+                en_clk_radio, en_clk_imu, en_clk_temp,
+                power_mW);
+        end
+ 
+        //PHASE 4: ECLIPSE + RADIO TASK → wake to ACTIVE 
+
+        $display("\n[PHASE 4] Eclipse, radio task arrives — FSM wakes ACTIVE");
+        push_task = 2'b10;   // radio task only
+        repeat(15) begin
+            @(posedge clk);
+            $write(" %6t    |  %3d  | ", $time, cycle_count);
+            print_state(fsm_state);
+            $display(" |  %b  |  %b  |   %b   |  %b  |   %b  | %0d",
+                sunlit, eclipse,
+                en_clk_radio, en_clk_imu, en_clk_temp,
+                power_mW);
+        end
+        push_task = 2'b00;
+ 
+        //PHASE 5: Back to SUNLIT, no tasks → IDLE 
+
+        $display("\n[PHASE 5] Sunlit return, no tasks — expect IDLE/low-power");
+        repeat(35) begin
+            @(posedge clk);
+            $write(" %6t    |  %3d  | ", $time, cycle_count);
+            print_state(fsm_state);
+            $display(" |  %b  |  %b  |   %b   |  %b  |   %b  | %0d",
+                sunlit, eclipse,
+                en_clk_radio, en_clk_imu, en_clk_temp,
+                power_mW);
+        end
+ 
+        //POWER BUDGET REPORT 
+
+        $display("\n=======================================================");
+        $display("  POWER BUDGET REPORT  (toggle × Csw_scale × Vdd²)");
+        $display("=======================================================");
+        $display("  Total simulation cycles    : %0d", cycle_count);
+        $display("  Toggle count — Radio domain: %0d", toggle_radio);
+        $display("  Toggle count — IMU domain  : %0d", toggle_imu);
+        $display("  Toggle count — Temp domain : %0d", toggle_temp);
+        $display("  Total gated toggles        : %0d", toggle_radio+toggle_imu+toggle_temp);
+        $display("");
+        $display("  Accumulated power (ungated worst-case) : %0d", power_ungated_acc);
+        $display("  Accumulated power (gated, actual)      : %0d", power_gated_acc);
+        if (power_ungated_acc > 0) begin
+            $display("  Power savings ratio (×1000)            : %0d",
+                (power_ungated_acc - power_gated_acc) * 1000 / power_ungated_acc);
+        end
+        $display("");
+        $display("  Clock gating reduces dynamic power by");
+        $display("  eliminating switching in Radio (sleep/idle),");
+        $display("  IMU (sleep), and Temp (idle) domains per FSM state.");
+        $display("=======================================================");
+        $display("  SIMULATION COMPLETE — Open powergate_ip.vcd in GTKWave");
+        $display("=======================================================");
+ 
+        $finish;
+    end
+ 
+    // Timeout watchdog 
+
+    initial begin
+        #200000;
+        $display("[TIMEOUT] Simulation exceeded limit.");
+        $finish;
+    end
+ 
+endmodule
