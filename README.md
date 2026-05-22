@@ -2,7 +2,7 @@
 
 **StasisGate** is a synthesizable Verilog power management IP that implements VLSI‑style integrated clock gating (ICG) for CubeSat payloads. It dynamically stops clocks to the radio, IMU, and temperature sensor based on orbital phase (sunlit/eclipse) and a 2‑bit task queue. The design is simulated entirely in EDA Playground – no hardware required.
 
-**Key achievement:** 83% reduction in simulated dynamic power compared to an ungated baseline.
+**Key achievement:** 71.9% reduction in simulated dynamic power compared to an ungated baseline.
 
 ## Concept
 
@@ -100,8 +100,8 @@ External inputs
 
 ## The FSM transitions:
 
-| Current State | Condition | Next State |
-|---------------|-----------|-------------|
+| Current State | Condition -> Next State |
+|---------------|-------------------------|
 | ACTIVE        | no tasks & sunlit → IDLE |
 | ACTIVE        | no tasks & eclipse → DEEP_SLEEP |
 | IDLE          | tasks or eclipse → ACTIVE |
